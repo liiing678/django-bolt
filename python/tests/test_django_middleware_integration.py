@@ -27,6 +27,7 @@ from django.views.decorators.csrf import csrf_exempt
 
 from django_bolt import BoltAPI, Request
 from django_bolt.auth import IsAuthenticated, JWTAuthentication, create_jwt_for_user
+from django_bolt.exceptions import HTTPException
 from django_bolt.middleware import DjangoMiddleware, DjangoMiddlewareStack, TimingMiddleware
 from django_bolt.middleware.django_adapter import _is_django_builtin_middleware
 from django_bolt.responses import HTML, JSON
@@ -1902,3 +1903,186 @@ def test_full_pass_runs_hooks_in_declared_and_reverse_order(handler_kind):
         assert client.get("/x").status_code == 200
 
     assert calls == ["a.request", "b.request", "handler", "b.response", "a.response"]
+
+
+# =============================================================================
+# process_exception hooks and teardown on handler errors
+# =============================================================================
+
+
+def _exception_recording_middleware(name: str, calls: list[str], *, handle: bool = False) -> type:
+    class Recorder(MiddlewareMixin):
+        def process_exception(self, request, exception):
+            calls.append(f"{name}.exception")
+            if handle:
+                return HttpResponse(f"handled by {name}", status=500)
+            return None
+
+        def process_response(self, request, response):
+            calls.append(f"{name}.response")
+            return response
+
+    return Recorder
+
+
+@pytest.mark.parametrize("handler_kind", ["async", "sync"])
+def test_handler_error_reaches_process_exception_and_still_runs_response_hooks(handler_kind):
+    """A handled error runs process_exception innermost-first, then the response hooks."""
+    calls: list[str] = []
+    stack = DjangoMiddlewareStack(
+        [
+            _order_recording_middleware("a", calls),
+            _exception_recording_middleware("b", calls, handle=True),
+            _order_recording_middleware("c", calls),
+        ]
+    )
+    api = BoltAPI(middleware=[stack])
+
+    if handler_kind == "async":
+
+        @api.get("/boom")
+        async def boom():
+            raise ValueError("kaput")
+    else:
+
+        @api.get("/boom")
+        def boom():
+            raise ValueError("kaput")
+
+    with TestClient(api) as client:
+        response = client.get("/boom")
+
+    assert response.status_code == 500
+    assert response.text == "handled by b"
+    assert calls == [
+        "a.request",
+        "c.request",
+        "b.exception",
+        "c.response",
+        "b.response",
+        "a.response",
+    ]
+
+
+def test_unhandled_error_passes_all_process_exception_hooks_then_500():
+    """Hooks that return None let the error propagate to Bolt's own 500 handling."""
+    calls: list[str] = []
+    stack = DjangoMiddlewareStack(
+        [
+            _exception_recording_middleware("a", calls),
+            _exception_recording_middleware("b", calls),
+        ]
+    )
+    api = BoltAPI(middleware=[stack])
+
+    @api.get("/boom")
+    async def boom():
+        raise ValueError("kaput")
+
+    with TestClient(api) as client:
+        response = client.get("/boom")
+
+    assert response.status_code == 500
+    assert response.text != "handled by a"
+    assert response.text != "handled by b"
+    assert calls == ["b.exception", "a.exception"]
+
+
+def test_process_exception_innermost_handles_first():
+    """Once an inner hook handles the error, outer process_exception hooks do not run."""
+    calls: list[str] = []
+    stack = DjangoMiddlewareStack(
+        [
+            _exception_recording_middleware("outer", calls, handle=True),
+            _exception_recording_middleware("inner", calls, handle=True),
+        ]
+    )
+    api = BoltAPI(middleware=[stack])
+
+    @api.get("/boom")
+    async def boom():
+        raise ValueError("kaput")
+
+    with TestClient(api) as client:
+        response = client.get("/boom")
+
+    assert response.text == "handled by inner"
+    assert calls == ["inner.exception", "inner.response", "outer.response"]
+
+
+def test_process_exception_in_mixed_hook_and_call_only_stack():
+    """The compatibility chain gives hook middleware its process_exception chance."""
+    calls: list[str] = []
+
+    class CallOnly:
+        def __init__(self, get_response):
+            self.get_response = get_response
+
+        def __call__(self, request):
+            return self.get_response(request)
+
+    stack = DjangoMiddlewareStack([_exception_recording_middleware("guard", calls, handle=True), CallOnly])
+    api = BoltAPI(middleware=[stack])
+
+    @api.get("/boom")
+    async def boom():
+        raise ValueError("kaput")
+
+    with TestClient(api) as client:
+        response = client.get("/boom")
+
+    assert response.text == "handled by guard"
+    assert calls == ["guard.exception", "guard.response"]
+
+
+@pytest.mark.parametrize("handler_kind", ["async", "sync"])
+def test_django_middleware_wrapper_runs_process_exception(handler_kind):
+    """The single DjangoMiddleware wrapper also offers the error to process_exception."""
+    calls: list[str] = []
+
+    class ErrorMiddleware(MiddlewareMixin):
+        def process_exception(self, request, exception):
+            calls.append("exception")
+            return HttpResponse("recovered", status=502)
+
+    api = BoltAPI(middleware=[DjangoMiddleware(ErrorMiddleware)])
+
+    if handler_kind == "async":
+
+        @api.get("/boom")
+        async def boom():
+            raise ValueError("kaput")
+    else:
+
+        @api.get("/boom")
+        def boom():
+            raise ValueError("kaput")
+
+    with TestClient(api) as client:
+        response = client.get("/boom")
+
+    assert response.status_code == 502
+    assert response.text == "recovered"
+    assert calls == ["exception"]
+
+
+def test_http_exception_reaches_process_exception():
+    """Bolt's HTTPException is the view error that process_exception can intercept."""
+
+    class Guard(MiddlewareMixin):
+        def process_exception(self, request, exception):
+            if isinstance(exception, HTTPException):
+                return HttpResponse(f"saw {exception.status_code}", status=418)
+            return None
+
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([Guard])])
+
+    @api.get("/missing")
+    async def missing():
+        raise HTTPException(404, "gone")
+
+    with TestClient(api) as client:
+        response = client.get("/missing")
+
+    assert response.status_code == 418
+    assert response.text == "saw 404"

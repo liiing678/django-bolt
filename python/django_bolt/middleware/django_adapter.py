@@ -361,8 +361,9 @@ class DjangoMiddleware:
             }
             token = _request_context.set(ctx)
 
+        inline = in_lane_mode()
         try:
-            if in_lane_mode():
+            if inline:
                 django_response = self._lane_instance(django_request)
             elif self._sync_call_override:
                 # The bound method has no coroutine mark, where the instance has one.
@@ -379,10 +380,36 @@ class DjangoMiddleware:
             else:
                 # Sync middleware without async support - run in thread pool
                 django_response = await sync_to_async(self._middleware_instance, thread_sensitive=True)(django_request)
+        except Exception as exc:
+            # Give the middleware's process_exception hook one chance to turn
+            # the error into a response, as Django's handler does. A hook that
+            # returns None lets the error propagate to Bolt's error handling.
+            django_response = await self._run_process_exception(django_request, exc, inline)
+            if django_response is None:
+                raise
+            return _to_bolt_response(django_response)
+        else:
             return _to_bolt_response(django_response)
         finally:
             if token is not None:
                 _request_context.reset(token)
+
+    async def _run_process_exception(
+        self, django_request: HttpRequest, exception: Exception, inline: bool
+    ) -> HttpResponse | None:
+        """Run the middleware's process_exception hook. Return its response, or None."""
+        instance = self._lane_instance if inline else self._middleware_instance
+        hook = getattr(instance, "process_exception", None)
+        if hook is None:
+            return None
+        if inline:
+            return hook(django_request, exception)
+        if iscoroutinefunction(hook):
+            return await hook(django_request, exception)
+        response = await sync_to_async(hook, thread_sensitive=True)(django_request, exception)
+        if iscoroutine(response):
+            return await response
+        return response
 
     def __repr__(self) -> str:
         return f"DjangoMiddleware({self.middleware_class.__name__})"
@@ -483,6 +510,7 @@ class DjangoMiddlewareStack:
         "_call_middleware_chain_async",  # Precomputed sync_to_async wrapper
         "_request_phase_async",  # One thread hop for all request-phase hooks
         "_response_phase_async",  # One thread hop for all response-phase hooks
+        "_exception_phase_async",  # One thread hop for all exception-phase hooks
         "_compatibility_chain",  # Correctness-first mixed hook/call-only path
         "_ordered_hook_middleware",  # Hook middleware in declared order
         # Pre-computed for hot path (avoid hasattr/reversed in loops)
@@ -515,6 +543,7 @@ class DjangoMiddlewareStack:
         self._call_middleware_chain_async = None
         self._request_phase_async = None
         self._response_phase_async = None
+        self._exception_phase_async = None
         self._compatibility_chain = None
         self._ordered_hook_middleware = []
         # Pre-computed lists (populated in _create_middleware_instance)
@@ -543,7 +572,7 @@ class DjangoMiddlewareStack:
         """Return True if middleware defines any Django hook methods."""
         return any(
             hasattr(middleware_class, method_name)
-            for method_name in ("process_request", "process_view", "process_response")
+            for method_name in ("process_request", "process_view", "process_response", "process_exception")
         )
 
     def _create_hook_entry(self, middleware_class: type) -> dict[str, Any]:
@@ -551,7 +580,7 @@ class DjangoMiddlewareStack:
         is_django_builtin = _is_django_builtin_middleware(middleware_class)
         instance = middleware_class(_noop_get_response)
         entry = {"instance": instance, "is_django_builtin": is_django_builtin}
-        for name in ("process_request", "process_view", "process_response"):
+        for name in ("process_request", "process_view", "process_response", "process_exception"):
             raw = getattr(instance, name, None)
             # The plain sync hook. One thread hop runs all of them in order.
             entry[f"raw_{name}"] = raw
@@ -585,6 +614,7 @@ class DjangoMiddlewareStack:
         self._call_middleware_chain_async = None
         self._request_phase_async = None
         self._response_phase_async = None
+        self._exception_phase_async = None
         self._compatibility_chain = None
         self._ordered_hook_middleware = []
         self._django_process_request = []
@@ -638,6 +668,8 @@ class DjangoMiddlewareStack:
                 self._request_phase_async = sync_to_async(self._run_request_phase, thread_sensitive=True)
             if any(e["raw_process_response"] for e in entries):
                 self._response_phase_async = sync_to_async(self._run_response_phase, thread_sensitive=True)
+            if any(e["raw_process_exception"] for e in entries):
+                self._exception_phase_async = sync_to_async(self._run_exception_phase, thread_sensitive=True)
 
         has_hook_middleware = bool(self._ordered_hook_middleware)
         has_call_only_middleware = bool(call_only_classes)
@@ -688,6 +720,23 @@ class DjangoMiddlewareStack:
             if hook is not None:
                 django_response = hook(django_request, django_response)
         return django_response
+
+    def _run_exception_phase(
+        self, django_request: HttpRequest, exception: Exception, entered: int
+    ) -> HttpResponse | None:
+        """Run process_exception of each entered middleware, in reverse order.
+
+        Return the first response that a hook produces, or None. A None from
+        every hook lets the error propagate to Bolt's own error handling.
+        """
+        entries = self._ordered_hook_middleware
+        for index in range(entered - 1, -1, -1):
+            hook = entries[index]["raw_process_exception"]
+            if hook is not None:
+                response = hook(django_request, exception)
+                if response is not None:
+                    return response
+        return None
 
     def _build_call_only_chain(self, call_only_classes: list) -> Callable:
         """Build the sync middleware chain for __call__-only middleware."""
@@ -762,7 +811,20 @@ class DjangoMiddlewareStack:
                                 django_request,
                             )
                         if response is None:
-                            response = await _next(django_request)
+                            try:
+                                response = await _next(django_request)
+                            except Exception as exc:
+                                # Inner layers raised. Give this middleware's
+                                # process_exception hook one chance to handle
+                                # the error, innermost layer first.
+                                response = await self._invoke_hook(
+                                    _entry["raw_process_exception"],
+                                    _entry["process_exception"],
+                                    django_request,
+                                    exc,
+                                )
+                                if response is None:
+                                    raise
                     finally:
                         entered_hook_entries.pop()
 
@@ -846,7 +908,20 @@ class DjangoMiddlewareStack:
             else:
                 django_response, entered = await self._request_phase_async(django_request, request)
             if django_response is None:
-                django_response = _to_django_response(await self.get_response(request))
+                try:
+                    django_response = _to_django_response(await self.get_response(request))
+                except Exception as exc:
+                    # A handler error goes to the process_exception hooks of the
+                    # entered middleware, innermost first. A hook that returns a
+                    # response handles the error, and the response phase then
+                    # runs as usual. Otherwise the error reaches Bolt's own
+                    # error handling.
+                    if inline or self._exception_phase_async is None:
+                        django_response = self._run_exception_phase(django_request, exc, entered)
+                    else:
+                        django_response = await self._exception_phase_async(django_request, exc, entered)
+                    if django_response is None:
+                        raise
             if inline or self._response_phase_async is None:
                 django_response = self._run_response_phase(django_request, django_response, entered)
             else:
