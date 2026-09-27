@@ -374,6 +374,27 @@ api = BoltAPI(
 )
 ```
 
+### Hook order and short-circuit rules
+
+The declared order fixes the execution order. The rules are deterministic:
+
+1. `process_request` runs in the declared order.
+2. `process_view` runs in the declared order, after all `process_request` hooks.
+3. The handler runs.
+4. `process_response` runs in the reverse declared order.
+
+A hook that returns a response short-circuits the pipeline. Bolt skips the later
+stages: the remaining hooks, the handler, or both. The teardown of the entered
+layers still runs. Each middleware that the request entered runs its
+`process_response`, in reverse order. This rule includes the middleware that
+short-circuited. Middleware that the request never entered runs nothing.
+
+A handler error runs `process_exception` of the entered middleware, innermost
+first. The first hook that returns a response handles the error. The response
+phase then runs as usual. When every hook returns `None`, the error reaches
+Bolt's own error handling, and `process_response` does not run. The single
+`DjangoMiddleware` wrapper follows the same `process_exception` rule.
+
 ### Accessing Django request attributes
 
 Django middleware sets attributes on the request that are automatically synced to the Bolt request:
@@ -461,7 +482,7 @@ A middleware class with an async `__call__`, its own `__acall__`, or `sync_capab
 
 On a lane, `DjangoMiddleware` uses a second instance of your middleware class in sync mode, as Django does under WSGI. Thus `__init__` runs two times, and the two instances do not share attributes.
 
-In an async request, Bolt moves work to the lane one time for all `process_request` and `process_view` hooks. It moves work one more time for all `process_response` hooks. A stack with only Django built-in hooks runs them on the event loop.
+In an async request, Bolt moves work to the lane one time for all `process_request` and `process_view` hooks. It moves work one more time for all `process_response` hooks. A handler error adds one more move for the `process_exception` hooks. A stack with only Django built-in hooks runs them on the event loop.
 
 Lanes need no configuration. A request takes an idle lane, or Bolt starts a new one. A lane that stays idle for 10 seconds closes its database connections and stops. [`DJANGO_BOLT_LANE_IDLE_SECONDS`](../ref/settings.md#django_bolt_lane_idle_seconds) changes this time.
 
@@ -481,7 +502,7 @@ Django-Bolt optimizes middleware execution with a three-tier system:
 
 The `DjangoMiddlewareStack` automatically categorizes your middleware for optimal performance.
 
-If a `DjangoMiddlewareStack` mixes hook middleware (`process_request` / `process_view` / `process_response`) with `__call__`-only middleware, Django-Bolt uses a correctness-first compatibility path to preserve strict declared order and hook semantics. This path is slower than the pure hook fast path.
+If a `DjangoMiddlewareStack` mixes hook middleware (`process_request` / `process_view` / `process_response` / `process_exception`) with `__call__`-only middleware, Django-Bolt uses a correctness-first compatibility path to preserve strict declared order and hook semantics. This path is slower than the pure hook fast path.
 
 ## Middleware order
 
@@ -493,6 +514,10 @@ Python middleware execution order is explicit and strict:
 4. Handler
 
 For responses, the order is reversed.
+
+A middleware that returns a response short-circuits the pipeline. Bolt skips
+the later layers and the handler. The entered layers still run their teardown
+code on the way out.
 
 Rust-handled middleware configs (for example `@cors` and `@rate_limit`) are still compiled from metadata and executed in Rust.
 
